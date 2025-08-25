@@ -7,6 +7,9 @@ Useful for demos, exploring Azure Storage Discovery, testing throttling, and mak
 
 See more: https://zimmergren.net/how-to-populate-azure-storage-accounts-with-demo-data/
 
+<img width="2184" height="1358" alt="image" src="https://github.com/user-attachments/assets/73ad285f-328b-41da-8edf-4d1b9e66a55f" />
+
+
 ## Prerequisites
 
 - .NET 8 SDK (or newer)
