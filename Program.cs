@@ -1,28 +1,42 @@
 ﻿using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Azure.Data.Tables;
+using Azure.Identity;
 using Azure.Storage.Blobs;
 using Azure.Storage.Files.Shares;
 using Azure.Storage.Files.Shares.Models;
 using Azure.Storage.Queues;
 
+public enum AuthMode
+{
+    ConnectionString,
+    ManagedIdentity
+}
+
+public class StorageAccountConfig
+{
+    public string Name { get; set; } = string.Empty;
+    public string? ConnectionString { get; set; }
+}
+
+public class AppConfig
+{
+    public AuthMode AuthMode { get; set; }
+    public List<StorageAccountConfig> StorageAccounts { get; set; } = new();
+}
+
 public class Program
 {
-    // Selecting a subset of storage accounts to populate data into for the sake of demo purposes.
-    // Don't use this in production, dev, or test code.
-    private static readonly string[] StorageConnectionStrings = new[]
-    {
-        "<connection string 1>",
-        "<connection string 2>",
-        "<connection string 3>",
-        "<connection string 4>"
-    };
 
     private static readonly Random Rand = new();
 
     // Per-account context holding resource pools
     private class StorageContext
     {
-        public string ConnectionString = default!;
+        public string AccountName = default!;
+        public string? ConnectionString;
+        public AuthMode AuthMode;
         public List<BlobContainerClient> Containers = new();
         public List<TableClient> Tables = new();
         public List<QueueClient> Queues = new();
@@ -67,20 +81,37 @@ public class Program
 
     public static async Task Main(string[] args)
     {
-        // speed arg: slow | medium | fastest | random (default random)
-        string speedArg = args.Length > 0 ? args[0].Trim().ToLowerInvariant() : "random";
+        // Load configuration
+        string configPath = args.Length > 0 && !args[0].StartsWith("-") && File.Exists(args[0]) 
+            ? args[0] 
+            : "config.json";
+            
+        var config = await LoadConfigurationAsync(configPath);
+        if (config == null) return;
+
+        // Parse speed argument (skip config file path if provided)
+        string speedArg = args.Length > 1 ? args[1].Trim().ToLowerInvariant() 
+            : args.Length == 1 && !File.Exists(args[0]) ? args[0].Trim().ToLowerInvariant() 
+            : "random";
         Console.WriteLine($"Speed mode: {speedArg}");
+        Console.WriteLine($"Auth mode: {config.AuthMode}");
 
         // Build contexts per account
-        foreach (var cs in StorageConnectionStrings)
+        foreach (var accountConfig in config.StorageAccounts)
         {
-            if (string.IsNullOrWhiteSpace(cs)) continue;
-            _accounts.Add(new StorageContext { ConnectionString = cs });
+            if (string.IsNullOrWhiteSpace(accountConfig.Name)) continue;
+            
+            _accounts.Add(new StorageContext 
+            { 
+                AccountName = accountConfig.Name,
+                ConnectionString = accountConfig.ConnectionString,
+                AuthMode = config.AuthMode
+            });
         }
 
         if (_accounts.Count == 0)
         {
-            Console.WriteLine("No storage connection strings configured. Exiting.");
+            Console.WriteLine("No storage accounts configured. Exiting.");
             return;
         }
 
@@ -116,7 +147,12 @@ public class Program
                     await AddQueueMessages(ctx, NextCount(profile.Queues));
                     break;
                 case 3:
-                    await UploadFiles(ctx, NextCount(profile.Files));
+                    // Skip files when using managed identity due to limited SDK support
+                    // and when key-based auth is disabled on storage accounts
+                    if (ctx.AuthMode == AuthMode.ConnectionString && !string.IsNullOrEmpty(ctx.ConnectionString))
+                        await UploadFiles(ctx, NextCount(profile.Files));
+                    else
+                        await UploadBlobs(ctx, NextCount(profile.Blobs)); // fallback to blobs
                     break;
             }
 
@@ -155,12 +191,104 @@ public class Program
         return Fastest;
     }
 
+    private static async Task<AppConfig?> LoadConfigurationAsync(string configPath)
+    {
+        try
+        {
+            if (!File.Exists(configPath))
+            {
+                Console.WriteLine($"Configuration file '{configPath}' not found. Creating default config.json...");
+                await CreateDefaultConfigAsync();
+                Console.WriteLine("Please configure your storage accounts in config.json and run again.");
+                return null;
+            }
+
+            var configJson = await File.ReadAllTextAsync(configPath);
+            var config = JsonSerializer.Deserialize<AppConfig>(configJson, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true,
+                Converters = { new JsonStringEnumConverter() }
+            });
+
+            if (config == null || config.StorageAccounts.Count == 0)
+            {
+                Console.WriteLine("Invalid configuration. Please check your config file.");
+                return null;
+            }
+
+            // Validate configuration
+            if (config.AuthMode == AuthMode.ConnectionString)
+            {
+                var missingConnStrings = config.StorageAccounts.Where(a => string.IsNullOrEmpty(a.ConnectionString)).ToList();
+                if (missingConnStrings.Count > 0)
+                {
+                    Console.WriteLine($"Connection strings missing for accounts: {string.Join(", ", missingConnStrings.Select(a => a.Name))}");
+                    return null;
+                }
+            }
+
+            return config;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error loading configuration: {ex.Message}");
+            return null;
+        }
+    }
+
+    private static async Task CreateDefaultConfigAsync()
+    {
+        var defaultConfig = new AppConfig
+        {
+            AuthMode = AuthMode.ManagedIdentity,
+            StorageAccounts = new List<StorageAccountConfig>
+            {
+                new() { Name = "storageaccount1", ConnectionString = null },
+                new() { Name = "storageaccount2", ConnectionString = null },
+                new() { Name = "storageaccount3", ConnectionString = null }
+            }
+        };
+
+        var json = JsonSerializer.Serialize(defaultConfig, new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            Converters = { new JsonStringEnumConverter() }
+        });
+
+        await File.WriteAllTextAsync("config.json", json);
+    }
+
+    private static (BlobServiceClient, TableServiceClient, QueueServiceClient, ShareServiceClient) CreateServiceClients(StorageContext acct)
+    {
+        if (acct.AuthMode == AuthMode.ManagedIdentity)
+        {
+            var credential = new DefaultAzureCredential();
+            var blobUri = new Uri($"https://{acct.AccountName}.blob.core.windows.net");
+            var tableUri = new Uri($"https://{acct.AccountName}.table.core.windows.net");
+            var queueUri = new Uri($"https://{acct.AccountName}.queue.core.windows.net");
+            var shareUri = new Uri($"https://{acct.AccountName}.file.core.windows.net");
+
+            return (
+                new BlobServiceClient(blobUri, credential),
+                new TableServiceClient(tableUri, credential),
+                new QueueServiceClient(queueUri, credential),
+                new ShareServiceClient(shareUri, credential)
+            );
+        }
+        else
+        {
+            return (
+                new BlobServiceClient(acct.ConnectionString!),
+                new TableServiceClient(acct.ConnectionString!),
+                new QueueServiceClient(acct.ConnectionString!),
+                new ShareServiceClient(acct.ConnectionString!)
+            );
+        }
+    }
+
     private static async Task InitResourcesForAccount(StorageContext acct)
     {
-        var blobSvc = new BlobServiceClient(acct.ConnectionString);
-        var tableSvc = new TableServiceClient(acct.ConnectionString);
-        var queueSvc = new QueueServiceClient(acct.ConnectionString);
-        var shareSvc = new ShareServiceClient(acct.ConnectionString);
+        var (blobSvc, tableSvc, queueSvc, shareSvc) = CreateServiceClients(acct);
 
         int n = Rand.Next(20, 51); // 20–50
         var tasks = new List<Task>();
@@ -184,14 +312,17 @@ public class Program
             tasks.Add(queue.CreateIfNotExistsAsync());
             acct.Queues.Add(queue);
 
-            // File shares
-            var share = shareSvc.GetShareClient("s" + suffix);
-            tasks.Add(share.CreateIfNotExistsAsync());
-            acct.Shares.Add(share);
+            // File shares (skip for managed identity due to limited SDK support)
+            if (acct.AuthMode == AuthMode.ConnectionString && !string.IsNullOrEmpty(acct.ConnectionString))
+            {
+                var share = shareSvc.GetShareClient("s" + suffix);
+                tasks.Add(share.CreateIfNotExistsAsync());
+                acct.Shares.Add(share);
+            }
         }
 
         await Task.WhenAll(tasks);
-        Console.WriteLine($"Account ready: {acct.Containers.Count} containers, {acct.Tables.Count} tables, {acct.Queues.Count} queues, {acct.Shares.Count} shares.");
+        Console.WriteLine($"Account {acct.AccountName} ready: {acct.Containers.Count} containers, {acct.Tables.Count} tables, {acct.Queues.Count} queues, {acct.Shares.Count} shares.");
     }
 
     private static async Task UploadBlobs(StorageContext acct, int count)
@@ -277,11 +408,10 @@ public class Program
 
                 await ExecuteWithRetries(async () =>
                 {
-                    // Create+write with a single logical operation
-                    var opts = new ShareFileOpenWriteOptions { MaxSize = bytes.Length };
-                    await using var stream = await file.OpenWriteAsync(overwrite: true, position: 0, options: opts);
-                    await stream.WriteAsync(bytes, 0, bytes.Length);
-                    await stream.FlushAsync();
+                    // Create file with proper size first, then upload content
+                    await file.CreateAsync(bytes.Length);
+                    using var ms = new MemoryStream(bytes);
+                    await file.UploadRangeAsync(new Azure.HttpRange(0, bytes.Length), ms);
                 });
             }));
         }

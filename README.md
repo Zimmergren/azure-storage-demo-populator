@@ -13,26 +13,55 @@ See more: https://zimmergren.net/how-to-populate-azure-storage-accounts-with-dem
 ## Prerequisites
 
 - .NET 8 SDK (or newer)
-- One or more Azure Storage accounts with Access Keys enabled
-- Connection strings for 1 or more demo accounts (you will paste these into the code, use with caution, and only dummy accounts)
+- One or more Azure Storage accounts
+- For managed identity: Azure VM with managed identity assigned and Storage Blob Data Contributor role on target storage accounts
+- For connection strings: Access keys enabled on storage accounts (use only with dummy/demo accounts)
 
 ## Configuration
 
-Open `Program.cs` and populate the `StorageConnectionStrings` array with your storage account connection strings.  
-For example, provide 3–5 entries to spread load across multiple accounts across regions for a more realistic output.
+The application uses a JSON configuration file to specify authentication method and storage accounts. On first run, it creates a default `config.json` file.
 
-Example:
+### Managed Identity (Recommended for Azure VMs)
 
-```csharp
-private static readonly string[] StorageConnectionStrings = new[]
+Default configuration for Azure VMs with managed identity:
+
+```json
 {
-    "<storage-connstring-1>",
-    "<storage-connstring-2>",
-    "<storage-connstring-3>"
-    // "<storage-connstring-4>",
-    // "<storage-connstring-5>",
-};
+  "authMode": "ManagedIdentity",
+  "storageAccounts": [
+    {
+      "name": "storageaccount1",
+      "connectionString": null
+    },
+    {
+      "name": "storageaccount2",
+      "connectionString": null
+    }
+  ]
+}
 ```
+
+### Connection Strings
+
+For local development or environments without managed identity:
+
+```json
+{
+  "authMode": "ConnectionString", 
+  "storageAccounts": [
+    {
+      "name": "storageaccount1",
+      "connectionString": "DefaultEndpointsProtocol=https;AccountName=account1;AccountKey=key1;EndpointSuffix=core.windows.net"
+    },
+    {
+      "name": "storageaccount2", 
+      "connectionString": "DefaultEndpointsProtocol=https;AccountName=account2;AccountKey=key2;EndpointSuffix=core.windows.net"
+    }
+  ]
+}
+```
+
+Provide 3–5 storage accounts to spread load across multiple accounts/regions for realistic output.
 
 ## Usage
 
@@ -49,7 +78,11 @@ private static readonly string[] StorageConnectionStrings = new[]
    dotnet build
    ```
 
-3. Run the tool
+3. Configure storage accounts
+
+   On first run, the application creates a default `config.json` file. Edit this file with your storage account details.
+
+4. Run the tool
 
    Default mode (random speed with natural bursts):
    ```bash
@@ -59,8 +92,13 @@ private static readonly string[] StorageConnectionStrings = new[]
    Specific speed profile:
    ```bash
    dotnet run slow
-   dotnet run medium
+   dotnet run medium  
    dotnet run fastest
+   ```
+
+   Custom configuration file:
+   ```bash
+   dotnet run custom-config.json slow
    ```
 
    What it does:

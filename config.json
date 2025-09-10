@@ -1,0 +1,13 @@
+{
+  "authMode": "ManagedIdentity",
+  "storageAccounts": [
+    {
+      "name": "storagedemoacct121807",
+      "connectionString": null
+    },
+    {
+      "name": "storagedemoacct221807",
+      "connectionString": null
+    }
+  ]
+}

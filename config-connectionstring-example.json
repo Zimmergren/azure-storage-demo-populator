@@ -1,0 +1,13 @@
+{
+  "authMode": "ConnectionString",
+  "storageAccounts": [
+    {
+      "name": "storageaccount1",
+      "connectionString": "DefaultEndpointsProtocol=https;AccountName=storageaccount1;AccountKey=your_key_here;EndpointSuffix=core.windows.net"
+    },
+    {
+      "name": "storageaccount2",
+      "connectionString": "DefaultEndpointsProtocol=https;AccountName=storageaccount2;AccountKey=your_key_here;EndpointSuffix=core.windows.net"
+    }
+  ]
+}

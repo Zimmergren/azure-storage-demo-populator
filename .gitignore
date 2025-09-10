@@ -52,3 +52,11 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# Configuration files with sensitive data
+config-local.json
+config-prod.json
+config-dev.json
+*-connectionstring.json
+appsettings.Production.json
+appsettings.Development.json
