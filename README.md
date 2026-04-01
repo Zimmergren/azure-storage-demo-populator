@@ -94,7 +94,3 @@ This makes it easy to identify and selectively delete demo data.
 ## Cleanup
 
 All resources are prefixed with `demo-` (or `demot` for tables), making them easy to identify and delete manually in the Azure Portal or via scripts. Alternatively, delete the demo storage account(s) entirely.
-
-## License
-
-See [LICENSE](LICENSE) if present, or refer to the repository for terms.
