@@ -1,5 +1,7 @@
-﻿using System.Text;
+using System.Text;
+using System.Text.RegularExpressions;
 using Azure.Data.Tables;
+using Azure.Identity;
 using Azure.Storage.Blobs;
 using Azure.Storage.Files.Shares;
 using Azure.Storage.Files.Shares.Models;
@@ -7,22 +9,20 @@ using Azure.Storage.Queues;
 
 public class Program
 {
-    // Selecting a subset of storage accounts to populate data into for the sake of demo purposes.
-    // Don't use this in production, dev, or test code.
-    private static readonly string[] StorageConnectionStrings = new[]
-    {
-        "<connection string 1>",
-        "<connection string 2>",
-        "<connection string 3>",
-        "<connection string 4>"
-    };
+    // All resources created by this tool use this prefix so they can be identified and cleaned up.
+    private const string ResourcePrefix = "demo";
 
-    private static readonly Random Rand = new();
+    // Cap concurrent Azure SDK calls to avoid socket/thread-pool exhaustion.
+    private static readonly SemaphoreSlim Throttle = new(200, 200);
 
     // Per-account context holding resource pools
     private class StorageContext
     {
-        public string ConnectionString = default!;
+        public string AccountLabel = default!;
+        public BlobServiceClient BlobService = default!;
+        public TableServiceClient TableService = default!;
+        public QueueServiceClient QueueService = default!;
+        public ShareServiceClient ShareService = default!;
         public List<BlobContainerClient> Containers = new();
         public List<TableClient> Tables = new();
         public List<QueueClient> Queues = new();
@@ -64,25 +64,85 @@ public class Program
 
     private static List<StorageContext> _accounts = new();
     private static DateTime _startUtc;
+    private static readonly CancellationTokenSource _cts = new();
 
     public static async Task Main(string[] args)
     {
-        // speed arg: slow | medium | fastest | random (default random)
-        string speedArg = args.Length > 0 ? args[0].Trim().ToLowerInvariant() : "random";
+        // Wire up graceful shutdown on Ctrl+C
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            Console.WriteLine("\nShutdown requested. Finishing current batch...");
+            _cts.Cancel();
+        };
+
+        // Parse arguments
+        string speedArg = "random";
+        var accountNames = new List<string>();
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i] is "--speed" && i + 1 < args.Length)
+            {
+                speedArg = args[++i].Trim().ToLowerInvariant();
+            }
+            else if (args[i] is "--accounts")
+            {
+                for (int j = i + 1; j < args.Length && !args[j].StartsWith("--"); j++)
+                {
+                    accountNames.Add(args[j].Trim());
+                    i = j;
+                }
+            }
+
+        }
+
+        // Legacy: bare first arg as speed (e.g. "dotnet run slow")
+        if (args.Length > 0 && !args[0].StartsWith("--") && accountNames.Count == 0)
+            speedArg = args[0].Trim().ToLowerInvariant();
+
+        // Validate account names: must be 3-24 chars, lowercase alphanumeric only (Azure rule)
+        var validAccountName = new Regex(@"^[a-z0-9]{3,24}$");
+        foreach (var name in accountNames)
+        {
+            if (!validAccountName.IsMatch(name))
+            {
+                Console.WriteLine($"Invalid storage account name: '{name}'. Must be 3-24 lowercase alphanumeric characters.");
+                return;
+            }
+        }
+
         Console.WriteLine($"Speed mode: {speedArg}");
 
-        // Build contexts per account
-        foreach (var cs in StorageConnectionStrings)
+        // Build contexts using Managed Identity (DefaultAzureCredential)
+        if (accountNames.Count == 0)
         {
-            if (string.IsNullOrWhiteSpace(cs)) continue;
-            _accounts.Add(new StorageContext { ConnectionString = cs });
-        }
-
-        if (_accounts.Count == 0)
-        {
-            Console.WriteLine("No storage connection strings configured. Exiting.");
+            Console.WriteLine("No storage accounts configured.");
+            Console.WriteLine("  Use --accounts <name1> <name2> ... to specify target storage accounts.");
             return;
         }
+
+        var credential = new DefaultAzureCredential();
+        foreach (var name in accountNames)
+        {
+            var blobUri = new Uri($"https://{name}.blob.core.windows.net");
+            var tableUri = new Uri($"https://{name}.table.core.windows.net");
+            var queueUri = new Uri($"https://{name}.queue.core.windows.net");
+            var shareUri = new Uri($"https://{name}.file.core.windows.net");
+
+            // Azure Files OAuth requires ShareTokenIntent.Backup
+            var shareOptions = new ShareClientOptions { ShareTokenIntent = ShareTokenIntent.Backup };
+
+            _accounts.Add(new StorageContext
+            {
+                AccountLabel = name,
+                BlobService = new BlobServiceClient(blobUri, credential),
+                TableService = new TableServiceClient(tableUri, credential),
+                QueueService = new QueueServiceClient(queueUri, credential),
+                ShareService = new ShareServiceClient(shareUri, credential, shareOptions),
+            });
+        }
+        Console.WriteLine($"Using DefaultAzureCredential for {accountNames.Count} account(s).");
 
         // Create random-named resources per account
         Console.WriteLine("Initializing resources...");
@@ -95,7 +155,7 @@ public class Program
         _startUtc = DateTime.UtcNow;
 
         // Main loop: choose operation type and run a big parallel batch
-        while (true)
+        while (!_cts.Token.IsCancellationRequested)
         {
             var profile = ChooseProfile(speedArg);
 
@@ -103,40 +163,55 @@ public class Program
             var index = (int)((DateTime.UtcNow - _startUtc).TotalMinutes) % _accounts.Count;
             var ctx = _accounts[index];
 
-            int op = Rand.Next(4); // 0=blobs,1=tables,2=queues,3=files
-            switch (op)
+            int op = Random.Shared.Next(4);
+            try
             {
-                case 0:
-                    await UploadBlobs(ctx, NextCount(profile.Blobs));
-                    break;
-                case 1:
-                    await InsertTableRows(ctx, NextCount(profile.Tables));
-                    break;
-                case 2:
-                    await AddQueueMessages(ctx, NextCount(profile.Queues));
-                    break;
-                case 3:
-                    await UploadFiles(ctx, NextCount(profile.Files));
-                    break;
+                switch (op)
+                {
+                    case 0:
+                        await UploadBlobs(ctx, NextCount(profile.Blobs));
+                        break;
+                    case 1:
+                        await InsertTableRows(ctx, NextCount(profile.Tables));
+                        break;
+                    case 2:
+                        await AddQueueMessages(ctx, NextCount(profile.Queues));
+                        break;
+                    case 3:
+                        await UploadFiles(ctx, NextCount(profile.Files));
+                        break;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Azure.RequestFailedException ex)
+            {
+                Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] ERROR ({ex.Status}): {ex.Message.Split('\n')[0]}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] ERROR: {ex.Message.Split('\n')[0]}");
             }
 
-            // Delay with jitter; occasionally “pause less” for bursty feel
-            int delay = Rand.Next(profile.DelayBetweenBursts.minMs, profile.DelayBetweenBursts.maxMs);
-            if (Rand.NextDouble() < 0.15) delay = (int)(delay * 0.4); // short spike bursts
-            await Task.Delay(delay);
+            // Delay with jitter; occasionally "pause less" for bursty feel
+            int delay = Random.Shared.Next(profile.DelayBetweenBursts.minMs, profile.DelayBetweenBursts.maxMs);
+            if (Random.Shared.NextDouble() < 0.15) delay = (int)(delay * 0.4);
+            try { await Task.Delay(delay, _cts.Token); } catch (OperationCanceledException) { break; }
         }
+
+        Console.WriteLine("Stopped.");
     }
 
-    // Randomly ramp counts; sometimes enter “mega-burst”
     private static int NextCount((int min, int max) baseRange)
     {
-        // Normal variability
-        int value = Rand.Next(baseRange.min, baseRange.max + 1);
+        int value = Random.Shared.Next(baseRange.min, baseRange.max + 1);
 
-        // 10% chance to scale up 2–4x (mega burst)
-        if (Rand.NextDouble() < 0.10)
+        // 10% chance to scale up 2-4x (mega burst)
+        if (Random.Shared.NextDouble() < 0.10)
         {
-            double mult = 2 + Rand.NextDouble() * 2; // 2–4x
+            double mult = 2 + Random.Shared.NextDouble() * 2;
             value = (int)(value * mult);
         }
 
@@ -148,8 +223,7 @@ public class Program
         if (mode == "slow") return Slow;
         if (mode == "medium") return Medium;
         if (mode == "fastest") return Fastest;
-        // random: sometimes change the overall profile too (to simulate day/night load)
-        double r = Rand.NextDouble();
+        double r = Random.Shared.NextDouble();
         if (r < 0.25) return Slow;
         if (r < 0.60) return Medium;
         return Fastest;
@@ -157,54 +231,53 @@ public class Program
 
     private static async Task InitResourcesForAccount(StorageContext acct)
     {
-        var blobSvc = new BlobServiceClient(acct.ConnectionString);
-        var tableSvc = new TableServiceClient(acct.ConnectionString);
-        var queueSvc = new QueueServiceClient(acct.ConnectionString);
-        var shareSvc = new ShareServiceClient(acct.ConnectionString);
-
-        int n = Rand.Next(20, 51); // 20–50
+        int n = Random.Shared.Next(20, 51);
         var tasks = new List<Task>();
 
         for (int i = 0; i < n; i++)
         {
-            string suffix = Guid.NewGuid().ToString("N").Substring(0, 8);
+            string suffix = Guid.NewGuid().ToString("N")[..8];
 
-            // Containers
-            var container = blobSvc.GetBlobContainerClient("c" + suffix);
+            var container = acct.BlobService.GetBlobContainerClient($"{ResourcePrefix}-c{suffix}");
             tasks.Add(container.CreateIfNotExistsAsync());
             acct.Containers.Add(container);
 
-            // Tables
-            var table = tableSvc.GetTableClient("t" + suffix);
+            // Table names cannot contain hyphens
+            var table = acct.TableService.GetTableClient($"{ResourcePrefix}t{suffix}");
             tasks.Add(table.CreateIfNotExistsAsync());
             acct.Tables.Add(table);
 
-            // Queues
-            var queue = queueSvc.GetQueueClient("q" + suffix);
+            var queue = acct.QueueService.GetQueueClient($"{ResourcePrefix}-q{suffix}");
             tasks.Add(queue.CreateIfNotExistsAsync());
             acct.Queues.Add(queue);
 
-            // File shares
-            var share = shareSvc.GetShareClient("s" + suffix);
+            var share = acct.ShareService.GetShareClient($"{ResourcePrefix}-s{suffix}");
             tasks.Add(share.CreateIfNotExistsAsync());
             acct.Shares.Add(share);
         }
 
         await Task.WhenAll(tasks);
-        Console.WriteLine($"Account ready: {acct.Containers.Count} containers, {acct.Tables.Count} tables, {acct.Queues.Count} queues, {acct.Shares.Count} shares.");
+        Console.WriteLine($"[{acct.AccountLabel}] Ready: {acct.Containers.Count} containers, {acct.Tables.Count} tables, {acct.Queues.Count} queues, {acct.Shares.Count} shares.");
+    }
+
+    private static async Task ThrottledRun(Func<Task> work)
+    {
+        await Throttle.WaitAsync(_cts.Token);
+        try { await work(); }
+        finally { Throttle.Release(); }
     }
 
     private static async Task UploadBlobs(StorageContext acct, int count)
     {
-        var container = acct.Containers[Rand.Next(acct.Containers.Count)];
+        var container = acct.Containers[Random.Shared.Next(acct.Containers.Count)];
         Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Blobs: {count} => {container.Name}");
         var tasks = new List<Task>(capacity: count);
 
         for (int i = 0; i < count; i++)
         {
-            tasks.Add(Task.Run(async () =>
+            tasks.Add(ThrottledRun(async () =>
             {
-                var blob = container.GetBlobClient($"blob-{Guid.NewGuid():N}.txt");
+                var blob = container.GetBlobClient($"{ResourcePrefix}-blob-{Guid.NewGuid():N}.txt");
                 var content = Encoding.UTF8.GetBytes($"Blob {Guid.NewGuid()} @ {DateTime.UtcNow:o}");
                 using var ms = new MemoryStream(content);
                 await blob.UploadAsync(ms, overwrite: true);
@@ -216,21 +289,21 @@ public class Program
 
     private static async Task InsertTableRows(StorageContext acct, int count)
     {
-        var table = acct.Tables[Rand.Next(acct.Tables.Count)];
+        var table = acct.Tables[Random.Shared.Next(acct.Tables.Count)];
         Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Table: {count} => {table.Name}");
         var tasks = new List<Task>(capacity: count);
 
         for (int i = 0; i < count; i++)
         {
-            tasks.Add(Task.Run(() =>
+            tasks.Add(ThrottledRun(() =>
             {
                 var entity = new TableEntity(
-                    partitionKey: "p" + Rand.Next(1, 101).ToString(), // spread partition keys 1..100
+                    partitionKey: $"{ResourcePrefix}-p{Random.Shared.Next(1, 101)}",
                     rowKey: Guid.NewGuid().ToString("N"))
                 {
                     { "Msg", $"Hi {Guid.NewGuid()}" },
                     { "TsUtc", DateTime.UtcNow },
-                    { "Shard", Rand.Next(0, 1024) }
+                    { "Shard", Random.Shared.Next(0, 1024) }
                 };
                 return table.AddEntityAsync(entity);
             }));
@@ -241,16 +314,15 @@ public class Program
 
     private static async Task AddQueueMessages(StorageContext acct, int count)
     {
-        var queue = acct.Queues[Rand.Next(acct.Queues.Count)];
+        var queue = acct.Queues[Random.Shared.Next(acct.Queues.Count)];
         Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Queue: {count} => {queue.Name}");
         var tasks = new List<Task>(capacity: count);
 
         for (int i = 0; i < count; i++)
         {
-            tasks.Add(Task.Run(() =>
+            tasks.Add(ThrottledRun(() =>
             {
                 var msg = $"Message {Guid.NewGuid()} @ {DateTime.UtcNow:o}";
-                // Base64-encode to be explicit
                 return queue.SendMessageAsync(Convert.ToBase64String(Encoding.UTF8.GetBytes(msg)));
             }));
         }
@@ -258,26 +330,24 @@ public class Program
         await Task.WhenAll(tasks);
     }
 
-
     private static async Task UploadFiles(StorageContext acct, int count)
     {
-        var share = acct.Shares[Rand.Next(acct.Shares.Count)];
-        var root = share.GetRootDirectoryClient(); // root exists by definition
+        var share = acct.Shares[Random.Shared.Next(acct.Shares.Count)];
+        var root = share.GetRootDirectoryClient();
 
         Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Files: {count} => {share.Name}");
         var tasks = new List<Task>(count);
 
         for (int i = 0; i < count; i++)
         {
-            tasks.Add(Task.Run(async () =>
+            tasks.Add(ThrottledRun(async () =>
             {
-                var fileName = $"file-{Guid.NewGuid():N}.txt";
+                var fileName = $"{ResourcePrefix}-file-{Guid.NewGuid():N}.txt";
                 var file = root.GetFileClient(fileName);
                 var bytes = Encoding.UTF8.GetBytes($"File {Guid.NewGuid()} @ {DateTime.UtcNow:o}");
 
                 await ExecuteWithRetries(async () =>
                 {
-                    // Create+write with a single logical operation
                     var opts = new ShareFileOpenWriteOptions { MaxSize = bytes.Length };
                     await using var stream = await file.OpenWriteAsync(overwrite: true, position: 0, options: opts);
                     await stream.WriteAsync(bytes, 0, bytes.Length);
@@ -288,6 +358,7 @@ public class Program
 
         await Task.WhenAll(tasks);
     }
+
 
     static async Task ExecuteWithRetries(Func<Task> op, int maxRetries = 5)
     {
@@ -300,9 +371,9 @@ public class Program
                 return;
             }
             catch (Azure.RequestFailedException ex) when (
-                ex.Status == 404 ||                 // ResourceNotFound (eventual consistency/race)
-                ex.Status == 409 ||                 // Conflict/lease-y moments
-                ex.Status == 503 || ex.Status == 500 || ex.Status == 429) // transient
+                ex.Status == 404 ||
+                ex.Status == 409 ||
+                ex.Status == 503 || ex.Status == 500 || ex.Status == 429)
             {
                 if (attempt == maxRetries) throw;
                 await Task.Delay(delayMs);
@@ -310,5 +381,4 @@ public class Program
             }
         }
     }
-
 }

@@ -1,79 +1,100 @@
-# azure-storage-demo-populator
+# Azure Storage Demo Populator
 
-A small console app that continuously generates **dummy activity** across Azure Storage accounts.
+A .NET console app that continuously generates real, but **dummy activity**, across one or more Azure Storage accounts. It creates random containers, tables, queues, and file shares, then uploads blobs, inserts table rows, pushes queue messages, and writes files in parallel bursts.
 
-It creates random containers, tables, queues, and file shares, then uploads blobs, inserts rows, and pushes queue messages in bursts.  
-Useful for demos, exploring Azure Storage Discovery, testing throttling, and making empty accounts look production‑like.
+Useful for demos, exploring Azure Storage Discovery, testing throttling behavior, and making empty accounts look production-like.
 
-See more: https://zimmergren.net/how-to-populate-azure-storage-accounts-with-demo-data/
+> See the companion blog post: [How to populate Azure Storage Accounts with demo data](https://zimmergren.net/how-to-populate-azure-storage-accounts-with-demo-data/)
 
-<img width="2184" height="1358" alt="image" src="https://github.com/user-attachments/assets/73ad285f-328b-41da-8edf-4d1b9e66a55f" />
-
+<img width="2184" height="1358" alt="Azure Storage Demo Populator screenshot" src="https://github.com/user-attachments/assets/73ad285f-328b-41da-8edf-4d1b9e66a55f" />
 
 ## Prerequisites
 
-- .NET 8 SDK (or newer)
-- One or more Azure Storage accounts with Access Keys enabled
-- Connection strings for 1 or more demo accounts (you will paste these into the code, use with caution, and only dummy accounts)
+- [.NET 9 SDK](https://dotnet.microsoft.com/download) (or newer)
+- One or more Azure Storage accounts
 
-## Configuration
+## Authentication
 
-Open `Program.cs` and populate the `StorageConnectionStrings` array with your storage account connection strings.  
-For example, provide 3–5 entries to spread load across multiple accounts across regions for a more realistic output.
+Uses `DefaultAzureCredential` from the Azure Identity SDK. This works with Managed Identity, Azure CLI, Visual Studio, and other credential sources — no secrets required.
 
-Example:
+Provide storage account names as arguments:
 
-```csharp
-private static readonly string[] StorageConnectionStrings = new[]
-{
-    "<storage-connstring-1>",
-    "<storage-connstring-2>",
-    "<storage-connstring-3>"
-    // "<storage-connstring-4>",
-    // "<storage-connstring-5>",
-};
+```bash
+dotnet run -- --accounts mystorageaccount1 mystorageaccount2 mystorageaccount3
 ```
+
+The tool connects to each account via `https://{name}.blob.core.windows.net` (and the corresponding table, queue, and file endpoints).
+
+> **Note:** The signed-in identity needs the following data-plane roles on each storage account:
+> - **Storage Blob Data Contributor** (blob containers & blobs)
+> - **Storage Table Data Contributor** (tables & entities)
+> - **Storage Queue Data Contributor** (queues & messages)
+> - **Storage File Data Privileged Contributor** (file shares & files — required for OAuth with `ShareTokenIntent.Backup`)
 
 ## Usage
 
-1. Clone the repo
+1. **Clone the repo**
 
    ```bash
    git clone https://github.com/Zimmergren/azure-storage-demo-populator.git
    cd azure-storage-demo-populator
    ```
 
-2. Build the project (restores NuGet packages automatically)
+2. **Build**
 
    ```bash
    dotnet build
    ```
 
-3. Run the tool
+3. **Run**
 
-   Default mode (random speed with natural bursts):
    ```bash
-   dotnet run
+   dotnet run -- --accounts storageaccount1 storageaccount2
    ```
 
-   Specific speed profile:
+   With a speed profile:
    ```bash
-   dotnet run slow
-   dotnet run medium
-   dotnet run fastest
+   dotnet run -- --speed medium --accounts storageaccount1 storageaccount2
    ```
 
-   What it does:
-   - Rotates between your configured storage accounts about once per minute
-   - Randomly selects a container, table, queue, or file share
-   - Creates many resources up front (20–50 per type) with random names
-   - Populates them with thousands of blobs, rows, messages, or files in parallel
-   - Continues indefinitely until you stop it
-   - Can add multi-million transactions in a short time, so consider how long you want to leave it running and at what speed.
+### Speed profiles
+
+| Profile    | Description |
+|------------|-------------|
+| `slow`     | Small batches (20–80 items), longer pauses |
+| `medium`   | Moderate batches (200–800 items) |
+| `fastest`  | Large batches (800–2500 items), minimal pauses |
+| `random`   | *(default)* Randomly switches between profiles to simulate organic load |
+
+### What it does
+
+- Creates 20–50 randomly named containers, tables, queues, and file shares per account on startup
+- Rotates between configured storage accounts approximately once per minute
+- Randomly selects an operation type (blob upload, table insert, queue message, file write)
+- Runs operations in parallel with occasional "mega-burst" spikes (2–4× normal volume)
+- Continues indefinitely until stopped (`Ctrl+C`)
+- Can generate multi-million transactions quickly — consider how long you leave it running
+
+## Resource naming
+
+All resources created by this tool are prefixed with `demo-` (or `demot` for tables, which don't allow hyphens):
+
+| Resource type | Name pattern | Example |
+|---------------|-------------|--------|
+| Blob container | `demo-c{8hex}` | `demo-c4a8f1b2e` |
+| Table | `demot{8hex}` | `demot4a8f1b2e` |
+| Queue | `demo-q{8hex}` | `demo-q4a8f1b2e` |
+| File share | `demo-s{8hex}` | `demo-s4a8f1b2e` |
+| Blobs | `demo-blob-{guid}.txt` | |
+| Files | `demo-file-{guid}.txt` | |
+| Table rows | partition key `demo-p{1-100}` | |
+
+This makes it easy to identify and selectively delete demo data.
 
 ## Cleanup
 
-This will generate thousands or millions of transactions and objects.  
-The simplest cleanup is to delete the demo storage account(s) in the Azure Portal.
+All resources are prefixed with `demo-` (or `demot` for tables), making them easy to identify and delete manually in the Azure Portal or via scripts. Alternatively, delete the demo storage account(s) entirely.
 
-See more: [How to populate Azure Storage Accounts with demo data](https://zimmergren.net/how-to-populate-azure-storage-accounts-with-demo-data/)
+## License
+
+See [LICENSE](LICENSE) if present, or refer to the repository for terms.
